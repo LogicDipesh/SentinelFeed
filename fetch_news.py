@@ -171,24 +171,50 @@ def categorise(items: list[dict], seen: set) -> tuple[list, list]:
 
 def build_message(defense: list[dict], tools: list[dict]) -> str:
     today = datetime.now(timezone.utc).strftime("%d %b %Y")
-    lines = [f"🤖 *AI Daily Digest — {today}*\n"]
+    lines = [f"🤖 <b>AI Daily Digest — {today}</b>\n"]
 
     if defense:
-        lines.append("🛡 *AI IN DEFENSE*")
+        lines.append("🛡 <b>AI IN DEFENSE</b>")
         for i, item in enumerate(defense, 1):
             title = truncate_title(item["title"])
             src   = item["source"]
             url   = item["url"]
             summ  = item["summary"]
-            lines.append(f"{i}\\. [{title}]({url})")
+
+            lines.append(f'{i}. <a href="{url}">{title}</a>')
+
             if summ:
-                lines.append(f"   _{summ}_")
-            lines.append(f"   `{src}`")
+                lines.append(f"   <i>{summ}</i>")
+
+            lines.append(f"   <code>{src}</code>")
             lines.append("")
     else:
-        lines.append("🛡 *AI IN DEFENSE*\nNo major stories today\\.\n")
+        lines.append("🛡 <b>AI IN DEFENSE</b>\nNo major stories today.\n")
 
     lines.append("─────────────────────")
+
+    if tools:
+        lines.append("\n🛠 <b>NEW AI TOOLS & RELEASES</b>")
+        for i, item in enumerate(tools, 1):
+            title = truncate_title(item["title"])
+            src   = item["source"]
+            url   = item["url"]
+            summ  = item["summary"]
+
+            lines.append(f'{i}. <a href="{url}">{title}</a>')
+
+            if summ:
+                lines.append(f"   <i>{summ}</i>")
+
+            lines.append(f"   <code>{src}</code>")
+            lines.append("")
+    else:
+        lines.append("\n🛠 <b>NEW AI TOOLS & RELEASES</b>\nNothing notable today.\n")
+
+    lines.append("─────────────────────")
+    lines.append("<i>Powered by NewsAPI · HN · ArXiv</i>")
+
+    return "\n".join(lines)
 
     if tools:
         lines.append("\n🛠 *NEW AI TOOLS & RELEASES*")
@@ -216,7 +242,7 @@ def send_telegram(text: str):
     payload = {
         "chat_id": TELEGRAM_CHAT,
         "text": text,
-        "parse_mode": "MarkdownV2",
+        "parse_mode": "HTML",
         "disable_web_page_preview": False,
     }
     r = requests.post(url, json=payload, timeout=15)
