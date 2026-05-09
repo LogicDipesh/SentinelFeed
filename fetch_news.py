@@ -38,7 +38,14 @@ TOOLS_KEYWORDS = [
     "GPT", "Claude", "Gemini", "Llama", "Mistral", "Qwen", "Phi", "DeepSeek",
     "Grok", "Hugging Face", "Ollama", "LangChain", "CrewAI", "AutoGen",
     "ComfyUI", "Stable Diffusion", "Flux", "image generation", "code assistant",
-    "AI assistant", "AI agent", "plugin", "extension", "API update",
+    "AI assistant", "plugin", "extension", "API update",
+]
+
+# ArXiv papers need these SPECIFIC terms to qualify as tools — much stricter
+ARXIV_TOOLS_KEYWORDS = [
+    "open source", "open-source", "we release", "publicly available", "available at",
+    "github.com", "huggingface.co", "pip install", "new dataset", "benchmark release",
+    "we open", "code available", "model weights", "released model",
 ]
 
 GENERAL_AI_KEYWORDS = [
@@ -112,8 +119,8 @@ Return format example: ["summary for item 1", "summary for item 2"]"""
 
     try:
         url = (
-            "https://generativelanguage.googleapis.com/v1beta/models"
-            f"/gemini-2.0-flash:generateContent?key={GEMINI_KEY}"
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-2.0-flash:generateContent?key={GEMINI_KEY}"
         )
         r = requests.post(
             url,
@@ -134,7 +141,9 @@ Return format example: ["summary for item 1", "summary for item 2"]"""
         print(f"  Summarised {len(summaries)} items via Gemini 2.0 Flash.")
         return items
     except Exception as e:
+        import traceback
         print(f"Gemini summarise error: {e}")
+        traceback.print_exc()
         # Fallback: use truncated raw text
         for item in items:
             raw = strip_html(item.get("summary", "") or "")
@@ -236,16 +245,23 @@ def categorise(items: list[dict], seen: set) -> tuple[list, list]:
         else:
             is_defense = count_matches(blob, DEFENSE_KEYWORDS) >= 2
 
-        is_tool = matches_any(blob, TOOLS_KEYWORDS)
-        is_ai   = matches_any(blob, GENERAL_AI_KEYWORDS)
+        # Use stricter keyword set for ArXiv to avoid pure research papers
+        if is_arxiv:
+            is_tool = matches_any(blob, ARXIV_TOOLS_KEYWORDS)
+        else:
+            is_tool = matches_any(blob, TOOLS_KEYWORDS)
+        is_ai = matches_any(blob, GENERAL_AI_KEYWORDS)
 
         if is_defense:
             defense.append(item)
-        elif is_tool or (is_ai and not is_arxiv):
-            # ArXiv papers only qualify if they match tools keywords directly
-            if is_arxiv and not is_tool:
-                continue
-            tools.append(item)
+        elif is_arxiv:
+            # ArXiv only qualifies if it explicitly releases something usable
+            if is_tool:
+                tools.append(item)
+        else:
+            # NewsAPI and HN: include if tool or general AI news
+            if is_tool or is_ai:
+                tools.append(item)
 
     return defense[:5], tools[:7]
 
