@@ -3,20 +3,23 @@ import re
 import json
 import time
 import hashlib
+import traceback
 import feedparser
 import requests
 from datetime import datetime, timedelta, timezone
 
 # ── Config ────────────────────────────────────────────────────────────────────
-NEWS_API_KEY    = os.environ["NEWS_API_KEY"]
-TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT   = os.environ["TELEGRAM_CHAT_ID"]
-GEMINI_KEY      = os.environ["GEMINI_API_KEY"]
+NEWS_API_KEY   = os.environ["NEWS_API_KEY"]
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT  = os.environ["TELEGRAM_CHAT_ID"]
+GEMINI_KEY     = os.environ["GEMINI_API_KEY"]
 
-SEEN_FILE = "seen_hashes.json"
+SEEN_FILE      = "seen_hashes.json"
+GEMINI_URL     = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
 # ── Keyword filters ───────────────────────────────────────────────────────────
-# Defense: needs 2+ matches to avoid false positives like academic papers
+
+# Defense news: needs 2+ hits from this list (non-ArXiv sources)
 DEFENSE_KEYWORDS = [
     "military", "weapon", "warfare", "pentagon", "nato", "darpa",
     "battlefield", "combat", "armed forces", "defence", "defense department",
@@ -26,12 +29,13 @@ DEFENSE_KEYWORDS = [
     "lethal autonomous", "war", "troops", "soldier", "army", "navy", "air force",
 ]
 
-# For ArXiv: only include if these very specific terms appear
+# ArXiv defense: needs 1 hit from this stricter list
 DEFENSE_ARXIV_STRICT = [
-    "military", "weapon", "warfare", "defense", "defence", "combat",
-    "battlefield", "missile", "drone strike", "cyber attack", "national security",
+    "military", "weapon", "warfare", "combat", "battlefield",
+    "missile", "drone strike", "cyber attack", "national security",
 ]
 
+# Tools for NewsAPI / HN
 TOOLS_KEYWORDS = [
     "launch", "releases", "released", "introducing", "new model", "now available",
     "open source", "open-source", "free tier", "just dropped", "available now",
@@ -41,11 +45,11 @@ TOOLS_KEYWORDS = [
     "AI assistant", "plugin", "extension", "API update",
 ]
 
-# ArXiv papers need these SPECIFIC terms to qualify as tools — much stricter
-ARXIV_TOOLS_KEYWORDS = [
-    "open source", "open-source", "we release", "publicly available", "available at",
-    "github.com", "huggingface.co", "pip install", "new dataset", "benchmark release",
-    "we open", "code available", "model weights", "released model",
+# ArXiv only: paper must EXPLICITLY release code/weights/dataset at a URL
+ARXIV_RELEASE_KEYWORDS = [
+    "github.com", "huggingface.co", "pip install", "model weights",
+    "we open-source", "we open source", "code is available", "code available at",
+    "released at", "available at https", "dataset available",
 ]
 
 GENERAL_AI_KEYWORDS = [
@@ -56,7 +60,7 @@ GENERAL_AI_KEYWORDS = [
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def load_seen():
+def load_seen() -> set:
     if os.path.exists(SEEN_FILE):
         with open(SEEN_FILE) as f:
             return set(json.load(f))
@@ -70,8 +74,8 @@ def make_hash(title: str) -> str:
     return hashlib.md5(title.lower().strip().encode()).hexdigest()[:10]
 
 def count_matches(text: str, keywords: list) -> int:
-    text_lower = text.lower()
-    return sum(1 for k in keywords if k.lower() in text_lower)
+    t = text.lower()
+    return sum(1 for k in keywords if k.lower() in t)
 
 def matches_any(text: str, keywords: list) -> bool:
     return count_matches(text, keywords) > 0
@@ -80,74 +84,82 @@ def strip_html(text: str) -> str:
     text = re.sub(r"<[^>]+>", "", text or "")
     return re.sub(r"\s+", " ", text).strip()
 
-def truncate_title(title: str, maxlen: int = 80) -> str:
-    # Remove source suffixes like " - Reuters" or " | TechCrunch"
+def clean_title(title: str, maxlen: int = 80) -> str:
     title = re.split(r" [-|] ", title)[0].strip()
     return title[:maxlen] + "…" if len(title) > maxlen else title
 
 # ── Gemini summariser ─────────────────────────────────────────────────────────
 
 def summarise_batch(items: list[dict]) -> list[dict]:
-    """
-    Send all items to Gemini 2.0 Flash in one API call.
-    Replaces each item's 'summary' with a plain-English 2-sentence version.
-    """
+    """Summarise all items in one Gemini API call. Falls back to raw text on error."""
     if not items:
         return items
 
     numbered = ""
     for i, item in enumerate(items, 1):
         raw = strip_html(item.get("summary", "") or item.get("title", ""))
-        numbered += f"{i}. TITLE: {item['title']}\n   TEXT: {raw[:600]}\n\n"
+        # Strip the ArXiv preamble that always appears
+        raw = re.sub(r"arXiv:\S+\s*Announce Type:\s*\w+\s*Abstract:\s*", "", raw).strip()
+        numbered += f"{i}. TITLE: {item['title']}\n   TEXT: {raw[:500]}\n\n"
 
-    prompt = f"""You are summarising AI news for a curious non-expert reader.
-
-For each numbered item below write EXACTLY 2 short plain-English sentences:
-- Sentence 1: What happened or what this is (no jargon).
-- Sentence 2: Why it matters or what someone can do with it.
-
-Rules:
-- Write like you are texting a smart friend, not writing a paper.
-- Keep each full summary under 180 characters.
-- If it is a pure academic paper with no practical use yet, say: "Researchers studied [X in simple words]. Mainly useful for AI scientists right now."
-- Return ONLY a JSON array of strings, one per item, in order. No markdown, no extra text.
-
-Items:
-{numbered}
-
-Return format example: ["summary for item 1", "summary for item 2"]"""
+    prompt = (
+        "You are summarising AI news for a curious non-expert reader.\n\n"
+        "For each numbered item below write EXACTLY 2 short plain-English sentences:\n"
+        "- Sentence 1: What happened or what this is (no jargon, no 'the paper proposes').\n"
+        "- Sentence 2: Why it matters or what someone can practically do with it.\n\n"
+        "Rules:\n"
+        "- Write like texting a smart friend, not writing an abstract.\n"
+        "- Keep each full summary under 200 characters total.\n"
+        "- If it is a pure academic paper with no practical use, write: "
+        "'Researchers explored [topic in plain words]. Mainly relevant to AI scientists for now.'\n"
+        "- Return ONLY a valid JSON array of strings, one per item, in order.\n"
+        "- No markdown fences, no extra text, no trailing commas.\n\n"
+        f"Items:\n{numbered}\n"
+        'Return format: ["summary 1", "summary 2", ...]'
+    )
 
     try:
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.0-flash:generateContent?key={GEMINI_KEY}"
-        )
-        r = requests.post(
-            url,
-            headers={"content-type": "application/json"},
+        resp = requests.post(
+            GEMINI_URL,
+            params={"key": GEMINI_KEY},
+            headers={"Content-Type": "application/json"},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"maxOutputTokens": 1024, "temperature": 0.3},
+                "generationConfig": {
+                    "maxOutputTokens": 1500,
+                    "temperature": 0.2,
+                    "responseMimeType": "application/json",
+                },
             },
-            timeout=30,
+            timeout=40,
         )
-        r.raise_for_status()
-        raw_text = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-        raw_text = re.sub(r"^```json\s*|^```\s*|\s*```$", "", raw_text, flags=re.MULTILINE).strip()
+        print(f"  Gemini status: {resp.status_code}")
+        if not resp.ok:
+            print(f"  Gemini error body: {resp.text[:500]}")
+            resp.raise_for_status()
+
+        data = resp.json()
+        raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        print(f"  Gemini raw response (first 300 chars): {raw_text[:300]}")
+
+        # Strip markdown fences if Gemini wraps them anyway
+        raw_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.MULTILINE).strip()
         summaries = json.loads(raw_text)
+
         for i, item in enumerate(items):
             if i < len(summaries):
-                item["summary"] = summaries[i]
+                item["summary"] = str(summaries[i])
         print(f"  Summarised {len(summaries)} items via Gemini 2.0 Flash.")
         return items
+
     except Exception as e:
-        import traceback
-        print(f"Gemini summarise error: {e}")
+        print(f"  Gemini summarise FAILED: {e}")
         traceback.print_exc()
-        # Fallback: use truncated raw text
+        # Fallback: strip ArXiv preamble and truncate
         for item in items:
             raw = strip_html(item.get("summary", "") or "")
-            item["summary"] = raw[:180] + "…" if len(raw) > 180 else raw
+            raw = re.sub(r"arXiv:\S+\s*Announce Type:\s*\w+\s*Abstract:\s*", "", raw).strip()
+            item["summary"] = raw[:200] + "…" if len(raw) > 200 else raw
         return items
 
 # ── Fetchers ──────────────────────────────────────────────────────────────────
@@ -181,12 +193,13 @@ def fetch_newsapi(query: str, page_size: int = 10) -> list[dict]:
 
 def fetch_hackernews() -> list[dict]:
     try:
+        since_ts = int((datetime.now(timezone.utc) - timedelta(days=1)).timestamp())
         r = requests.get(
             "http://hn.algolia.com/api/v1/search",
             params={
                 "query": "AI tool launch release open source LLM model",
                 "tags": "story",
-                "numericFilters": f"created_at_i>{int((datetime.now(timezone.utc) - timedelta(days=1)).timestamp())}",
+                "numericFilters": f"created_at_i>{since_ts}",
                 "hitsPerPage": 20,
             },
             timeout=15,
@@ -212,7 +225,7 @@ def fetch_arxiv() -> list[dict]:
     for feed_url in ["https://rss.arxiv.org/rss/cs.AI", "https://rss.arxiv.org/rss/cs.LG"]:
         try:
             feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:15]:
+            for entry in feed.entries[:20]:
                 items.append({
                     "title": entry.get("title", ""),
                     "url": entry.get("link", ""),
@@ -220,7 +233,7 @@ def fetch_arxiv() -> list[dict]:
                     "source": "ArXiv",
                 })
         except Exception as e:
-            print(f"ArXiv error: {e}")
+            print(f"ArXiv error ({feed_url}): {e}")
     return items
 
 # ── Categorise ────────────────────────────────────────────────────────────────
@@ -239,38 +252,34 @@ def categorise(items: list[dict], seen: set) -> tuple[list, list]:
         blob = f"{item['title']} {item.get('summary', '')}"
         is_arxiv = item["source"] == "ArXiv"
 
-        # Defense: strict thresholds
+        # ── Defense check ──
         if is_arxiv:
             is_defense = count_matches(blob, DEFENSE_ARXIV_STRICT) >= 1
         else:
             is_defense = count_matches(blob, DEFENSE_KEYWORDS) >= 2
 
-        # Use stricter keyword set for ArXiv to avoid pure research papers
+        # ── Tools check ──
         if is_arxiv:
-            is_tool = matches_any(blob, ARXIV_TOOLS_KEYWORDS)
+            # ArXiv: must contain an actual release URL or explicit open-source statement
+            is_tool = matches_any(blob, ARXIV_RELEASE_KEYWORDS)
         else:
             is_tool = matches_any(blob, TOOLS_KEYWORDS)
+
         is_ai = matches_any(blob, GENERAL_AI_KEYWORDS)
 
         if is_defense:
             defense.append(item)
-        elif is_arxiv:
-            # ArXiv only qualifies if it explicitly releases something usable
-            if is_tool:
-                tools.append(item)
-        else:
-            # NewsAPI and HN: include if tool or general AI news
-            if is_tool or is_ai:
-                tools.append(item)
+        elif is_arxiv and is_tool:
+            tools.append(item)
+        elif not is_arxiv and (is_tool or is_ai):
+            tools.append(item)
 
     return defense[:5], tools[:7]
 
 # ── Escape MarkdownV2 ─────────────────────────────────────────────────────────
 
-ESCAPE_CHARS = r"_*[]()~`>#+-=|{}.!"
-
 def esc(text: str) -> str:
-    for ch in ESCAPE_CHARS:
+    for ch in r"_*[]()~`>#+-=|{}.!":
         text = text.replace(ch, f"\\{ch}")
     return text
 
@@ -280,13 +289,13 @@ def build_message(defense: list[dict], tools: list[dict]) -> str:
     today = datetime.now(timezone.utc).strftime("%d %b %Y")
     lines = [f"🤖 *AI Daily Digest — {esc(today)}*\n"]
 
-    def format_section(items: list[dict]) -> list[str]:
+    def fmt(items: list[dict]) -> list[str]:
         out = []
         for i, item in enumerate(items, 1):
-            title = esc(truncate_title(item["title"]))
-            url   = item["url"]
+            title = esc(clean_title(item["title"]))
+            summ  = esc((item.get("summary") or "").strip())
             src   = esc(item["source"])
-            summ  = esc(item.get("summary", "").strip())
+            url   = item["url"]
             out.append(f"*{i}\\. [{title}]({url})*")
             if summ:
                 out.append(f"_{summ}_")
@@ -294,46 +303,37 @@ def build_message(defense: list[dict], tools: list[dict]) -> str:
         return out
 
     lines.append("🛡 *AI IN DEFENSE*")
-    if defense:
-        lines.extend(format_section(defense))
-    else:
-        lines.append("_No major defense stories today\\._\n")
+    lines.extend(fmt(defense) if defense else ["_No major defense stories today\\._\n"])
 
     lines.append("━━━━━━━━━━━━━━━━━━━━━")
     lines.append("\n🛠 *NEW AI TOOLS & RELEASES*")
-    if tools:
-        lines.extend(format_section(tools))
-    else:
-        lines.append("_Nothing notable released today\\._\n")
+    lines.extend(fmt(tools) if tools else ["_Nothing notable released today\\._\n"])
 
     lines.append("━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("_Powered by NewsAPI · HN · ArXiv · Claude_")
+    lines.append("_Powered by NewsAPI · HN · ArXiv · Gemini_")
     return "\n".join(lines)
 
-# ── Send to Telegram ──────────────────────────────────────────────────────────
+# ── Send Telegram ─────────────────────────────────────────────────────────────
 
 def send_telegram(text: str):
     r = requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-        json={
-            "chat_id": TELEGRAM_CHAT,
-            "text": text,
-            "parse_mode": "MarkdownV2",
-            "disable_web_page_preview": False,
-        },
+        json={"chat_id": TELEGRAM_CHAT, "text": text, "parse_mode": "MarkdownV2",
+              "disable_web_page_preview": False},
         timeout=15,
     )
     if not r.ok:
-        print(f"Telegram MarkdownV2 error {r.status_code}: {r.text}")
+        print(f"Telegram MarkdownV2 failed ({r.status_code}): {r.text[:300]}")
         print("Retrying as plain text…")
+        plain = re.sub(r"\\([_*\[\]()~`>#+=|{}.!-])", r"\1", text)
         r2 = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT, "text": text[:4000]},
+            json={"chat_id": TELEGRAM_CHAT, "text": plain[:4000]},
             timeout=15,
         )
         r2.raise_for_status()
     else:
-        print("Message sent successfully.")
+        print("Telegram: message sent.")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -347,7 +347,7 @@ def main():
         + fetch_hackernews()
         + fetch_arxiv()
     )
-    print(f"Raw items: {len(all_items)}")
+    print(f"Raw items fetched: {len(all_items)}")
 
     defense, tools = categorise(all_items, seen)
     print(f"After filter — Defense: {len(defense)}, Tools: {len(tools)}")
@@ -357,7 +357,7 @@ def main():
         save_seen(seen)
         return
 
-    print("Summarising with Claude Haiku…")
+    print("Summarising with Gemini…")
     defense = summarise_batch(defense)
     time.sleep(1)
     tools   = summarise_batch(tools)
